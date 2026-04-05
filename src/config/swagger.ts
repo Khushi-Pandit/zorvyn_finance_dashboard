@@ -15,6 +15,7 @@ const options: swaggerJSDoc.Options = {
     },
     servers: [
       { url: `http://localhost:${config.port}/api/v1`, description: 'Local development' },
+      { url: `https://zorvyn-fin-dashboard-t8fki.ondigitalocean.app/api/v1`, description: 'Production' },
     ],
     components: {
       securitySchemes: {
