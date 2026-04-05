@@ -1,0 +1,204 @@
+// =============================================================================
+//  Finance Backend — Prisma Schema
+//  Database:  PostgreSQL 16
+//  Prisma:    5.22.0  (Node >= 20.11 compatible)
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+//  ENUMS
+// =============================================================================
+
+/// Roles that control what a user can read/write across the system.
+/// VIEWER   -> read-only access to records and basic dashboard.
+/// ANALYST  -> everything VIEWER + advanced analytics and export.
+/// ADMIN    -> full CRUD on records, users, and categories.
+enum Role {
+  VIEWER
+  ANALYST
+  ADMIN
+}
+
+/// Lifecycle states for a user account.
+/// INACTIVE  -> login blocked; set by admin (e.g. off-boarded employee).
+/// SUSPENDED -> login blocked; set pending review (e.g. security concern).
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+/// The financial direction of a transaction.
+/// TRANSFER is money moving between own accounts — counted separately in analytics.
+enum RecordType {
+  INCOME
+  EXPENSE
+  TRANSFER
+}
+
+/// Describes what transaction types a category may be applied to.
+/// BOTH allows one category (e.g. "Transfer") to tag either direction.
+enum CategoryType {
+  INCOME
+  EXPENSE
+  BOTH
+}
+
+/// All actions that are written to the immutable audit log.
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  RESTORE
+  LOGIN
+  LOGOUT
+  ROLE_CHANGE
+  STATUS_CHANGE
+  PASSWORD_CHANGE
+}
+
+// =============================================================================
+//  USER
+// =============================================================================
+
+model User {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String     @unique @db.VarChar(255)
+  passwordHash String     @map("password_hash") @db.VarChar(255)
+  fullName     String     @map("full_name") @db.VarChar(120)
+  role         Role       @default(VIEWER)
+  status       UserStatus @default(ACTIVE)
+  lastLoginAt  DateTime?  @map("last_login_at") @db.Timestamptz
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt    DateTime?  @map("deleted_at") @db.Timestamptz
+
+  createdRecords   FinancialRecord[] @relation("RecordCreator")
+  modifiedRecords  FinancialRecord[] @relation("RecordModifier")
+  refreshTokens    RefreshToken[]
+  auditLogsAsActor AuditLog[]        @relation("AuditActor")
+
+  @@index([email])
+  @@index([deletedAt])
+  @@index([role])
+  @@index([status])
+  @@map("users")
+}
+
+// =============================================================================
+//  CATEGORY
+// =============================================================================
+
+model Category {
+  id       String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name     String       @unique @db.VarChar(80)
+  type     CategoryType
+  color    String?      @db.Char(7)
+  icon     String?      @db.VarChar(50)
+  isSystem Boolean      @default(false) @map("is_system")
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+
+  records FinancialRecord[]
+
+  @@index([type])
+  @@index([isSystem])
+  @@map("categories")
+}
+
+// =============================================================================
+//  FINANCIAL RECORD
+// =============================================================================
+
+model FinancialRecord {
+  id              String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  amount          Decimal    @db.Decimal(15, 2)
+  type            RecordType
+  date            DateTime   @db.Date
+  description     String?    @db.Text
+  referenceNumber String?    @unique @map("reference_number") @db.VarChar(100)
+  currency        String     @default("USD") @db.Char(3)
+  tags            String[]   @default([])
+  createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt       DateTime?  @map("deleted_at") @db.Timestamptz
+
+  categoryId       String? @map("category_id") @db.Uuid
+  createdById      String  @map("created_by") @db.Uuid
+  lastModifiedById String  @map("last_modified_by") @db.Uuid
+
+  category       Category? @relation(fields: [categoryId], references: [id])
+  createdBy      User      @relation("RecordCreator",  fields: [createdById],      references: [id])
+  lastModifiedBy User      @relation("RecordModifier", fields: [lastModifiedById], references: [id])
+
+  @@index([date, type])
+  @@index([categoryId])
+  @@index([createdById])
+  @@index([lastModifiedById])
+  @@index([deletedAt])
+  @@index([type])
+  @@index([currency])
+  @@index([date])
+  @@map("financial_records")
+}
+
+// =============================================================================
+//  REFRESH TOKEN
+// =============================================================================
+
+model RefreshToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tokenHash String    @unique @map("token_hash") @db.VarChar(64)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz
+  ipAddress String?   @map("ip_address") @db.VarChar(45)
+  userAgent String?   @map("user_agent") @db.Text
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([userId, revokedAt])
+  @@map("refresh_tokens")
+}
+
+// =============================================================================
+//  AUDIT LOG
+// =============================================================================
+
+model AuditLog {
+  id         String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  action     AuditAction
+  resource   String      @db.VarChar(50)
+
+  /// Stored as plain UUID string — NOT a foreign key — so the audit trail
+  /// survives even if the source row is later deleted. Supports any resource
+  /// type: financial_records, users, categories, etc.
+  resourceId String?     @map("resource_id") @db.Uuid
+
+  /// Before/after snapshot for UPDATE events. Never contains passwords.
+  changes    Json?
+
+  ipAddress  String?     @map("ip_address") @db.VarChar(45)
+  userAgent  String?     @map("user_agent") @db.Text
+  createdAt  DateTime    @default(now()) @map("created_at") @db.Timestamptz
+
+  actorId String @map("actor_id") @db.Uuid
+  actor   User   @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([actorId, createdAt])
+  @@index([resource, resourceId])
+  @@index([createdAt])
+  @@index([action])
+  @@map("audit_logs")
+}
